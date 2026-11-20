@@ -168,6 +168,11 @@ When running the `docker/Dockerfile.frigate-wildlife` overlay image:
 - **Geographic rollup**: Set `FRIGATE_SPECIESNET_COUNTRY` (ISO-3166 alpha-3, e.g. `USA`) and optionally `FRIGATE_SPECIESNET_STATE` (e.g. `TX`) in the Frigate container environment to enable SpeciesNet geofence rollup (out-of-range species roll up to genus/family/order instead of mislabeling).
 - **Blank rejection**: Add `reject_labels: [blank]` under `classification.custom.wildlife.object_config` to reject false-positive `animal` tracks that SpeciesNet classifies as `blank`.
 
+
+## Optional Extra: GPU-Accelerated BirdNET-Go (`extras/birdnet-go/`)
+
+`extras/birdnet-go/` contains the patch, build script, Dockerfile, and sample Compose file for running [BirdNET-Go](https://github.com/tphakala/birdnet-go) (`BirdNET_V2.4`, `BirdNET_V3.0`, `Perch_V2`) with lossless **TensorRT FP32** (persistent engine cache) + **CUDA** fallback on DGX Spark (`extras/birdnet-go/README.md`).
+
 ## Repository Contents
 
 - `requirements.txt`: Host Python dependencies (`numpy`, `onnx`, `onnxruntime`) for running scripts outside Docker.
@@ -181,6 +186,7 @@ When running the `docker/Dockerfile.frigate-wildlife` overlay image:
 - `test_adapter.py`: Validates adapted MegaDetector ONNX outputs against the unadapted model inside a Frigate container.
 - `docker/`: Reproducible `Dockerfile.frigate-wildlife` (with `patches/` and `apply_patches.py`), `Dockerfile.export`, `docker/dgx-spark/` (ARM64 Blackwell CUDA 13 + TensorRT ORT wheel builder & base Dockerfile), and `docker/biocap/` (optional BioCAP embeddings sidecar).
 - `examples/`: Sample `docker-compose.dgx-spark.yml` and `frigate-config.dgx-spark.yaml`.
+- `extras/birdnet-go/`: Optional BirdNET-Go TensorRT FP32 / CUDA 13 build files and sample Compose.
 
 ## Quick Usage (Reproducing Models)
 

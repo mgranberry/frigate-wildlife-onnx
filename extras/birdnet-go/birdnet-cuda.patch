@@ -1,0 +1,86 @@
+diff --git a/internal/inference/onnx.go b/internal/inference/onnx.go
+index 97712ef..7359471 100644
+--- a/internal/inference/onnx.go
++++ b/internal/inference/onnx.go
+@@ -63,6 +63,9 @@ func NewONNXClassifier(modelPath string, opts ONNXClassifierOptions) (Classifier
+ 	}
+ 	var configErr error
+ 	classifierOpts = append(classifierOpts, ort.WithSessionOptions(func(so *ortlib.SessionOptions) {
++		if gpuEnabled() {
++			configErr = configureGPU(so)
++		}
+ 		if err := so.SetIntraOpNumThreads(threads); err != nil && configErr == nil {
+ 			configErr = fmt.Errorf("failed to set IntraOpNumThreads to %d: %w", threads, err)
+ 		}
+@@ -166,6 +169,9 @@ func NewONNXCustomClassifier(modelPath string, opts ONNXCustomClassifierOptions)
+ 	}
+ 	var configErr error
+ 	builder = builder.SessionOptions(func(so *ortlib.SessionOptions) {
++		if gpuEnabled() {
++			configErr = configureGPU(so)
++		}
+ 		if err := so.SetIntraOpNumThreads(threads); err != nil && configErr == nil {
+ 			configErr = fmt.Errorf("failed to set IntraOpNumThreads to %d: %w", threads, err)
+ 		}
+@@ -401,3 +407,47 @@ func DestroyONNXRuntime() error {
+ 	clearORTRuntime()
+ 	return nil
+ }
++
++func gpuEnabled() bool {
++	return os.Getenv("BIRDNET_CUDA") == "1" || os.Getenv("BIRDNET_TENSORRT") == "1"
++}
++
++// configureGPU enables TensorRT (optional, FP32 by default) and CUDA execution providers.
++func configureGPU(so *ortlib.SessionOptions) error {
++	if os.Getenv("BIRDNET_TENSORRT") == "1" {
++		trtOpts, err := ortlib.NewTensorRTProviderOptions()
++		if err != nil {
++			return fmt.Errorf("create TensorRT options: %w", err)
++		}
++		defer trtOpts.Destroy()
++		cacheDir := os.Getenv("BIRDNET_TRT_CACHE_DIR")
++		if cacheDir == "" {
++			cacheDir = "/home/birdnet/.config/birdnet-go/trt-cache"
++		}
++		_ = os.MkdirAll(cacheDir, 0o755)
++		kv := map[string]string{
++			"trt_engine_cache_enable": "1",
++			"trt_engine_cache_path":   cacheDir,
++		}
++		if os.Getenv("BIRDNET_TRT_FP16") == "1" {
++			kv["trt_fp16_enable"] = "1"
++		}
++		if err := trtOpts.Update(kv); err != nil {
++			return fmt.Errorf("update TensorRT options: %w", err)
++		}
++		if err := so.AppendExecutionProviderTensorRT(trtOpts); err != nil {
++			return fmt.Errorf("enable TensorRT: %w", err)
++		}
++		fmt.Fprintf(os.Stderr, "BirdNET-Go: TensorRT execution provider enabled (cache=%s fp16=%s)\n", cacheDir, os.Getenv("BIRDNET_TRT_FP16"))
++	}
++	options, err := ortlib.NewCUDAProviderOptions()
++	if err != nil {
++		return fmt.Errorf("create CUDA options: %w", err)
++	}
++	defer options.Destroy()
++	if err := so.AppendExecutionProviderCUDA(options); err != nil {
++		return fmt.Errorf("enable CUDA: %w", err)
++	}
++	fmt.Fprintln(os.Stderr, "BirdNET-Go: CUDA execution provider enabled")
++	return nil
++}
+diff --git a/internal/inference/ort_status.go b/internal/inference/ort_status.go
+index bccd4bb..9ac4ac9 100644
+--- a/internal/inference/ort_status.go
++++ b/internal/inference/ort_status.go
+@@ -147,6 +147,9 @@ func inferVersionFromPath(libPath string) string {
+ // followed by a dot (ensuring "1.25" matches "1.25.x" but not "1.250").
+ // Also accepts an exact major.minor match without a patch version.
+ func isVersionCompatible(version string) bool {
++	if (os.Getenv("BIRDNET_CUDA") == "1" || os.Getenv("BIRDNET_TENSORRT") == "1") && (version == "1.32" || strings.HasPrefix(version, "1.32.")) {
++		return true
++	}
+ 	if version == "" {
+ 		return false
+ 	}

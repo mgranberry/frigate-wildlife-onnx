@@ -1,0 +1,24 @@
+services:
+  birdnet-go:
+    image: birdnet-go:20261031-trt-ort132
+    container_name: birdnet-go
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: America/Chicago
+      BIRDNET_CUDA: "1"
+      BIRDNET_TENSORRT: "1"
+      # Keep FP32 (default) for lossless accuracy on in-graph STFT/mel frontends.
+      # BIRDNET_TRT_FP16: "0"
+      BIRDNET_TRT_CACHE_DIR: /home/birdnet/.config/birdnet-go/trt-cache
+      BIRDNET_WEBSERVER_PORT: "16000"
+    volumes:
+      - ./config:/home/birdnet/.config/birdnet-go
+      - ./data:/home/birdnet/BirdNET-Go
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
