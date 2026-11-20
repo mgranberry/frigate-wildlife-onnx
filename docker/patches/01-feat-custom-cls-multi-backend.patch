@@ -1,0 +1,1157 @@
+diff --git a/frigate/config/classification.py b/frigate/config/classification.py
+index 0bfc454..c2874ba 100644
+--- a/frigate/config/classification.py
++++ b/frigate/config/classification.py
+@@ -2,6 +2,12 @@ from enum import Enum
+ 
+ from pydantic import ConfigDict, Field, field_validator
+ 
++from frigate.const import CLASSIFICATION_INPUT_SIZE
++from frigate.detectors.detector_config import (
++    InputDTypeEnum,
++    InputTensorEnum,
++)
++
+ from .base import FrigateBaseModel
+ 
+ __all__ = [
+@@ -51,6 +57,17 @@ class ObjectClassificationType(str, Enum):
+     attribute = "attribute"
+ 
+ 
++class CropStrategyEnum(str, Enum):
++    square = "square"
++    tight = "tight"
++    letterbox = "letterbox"
++
++
++class ClassificationPixelFormatEnum(str, Enum):
++    rgb = "rgb"
++    bgr = "bgr"
++
++
+ class AudioTranscriptionConfig(FrigateBaseModel):
+     enabled: bool = Field(
+         default=False,
+@@ -155,6 +172,17 @@ class CustomClassificationObjectConfig(FrigateBaseModel):
+         title="Classification type",
+         description="Classification type applied: 'sub_label' (adds sub_label) or other supported types.",
+     )
++    crop_strategy: CropStrategyEnum = Field(
++        default=CropStrategyEnum.square,
++        title="Crop strategy",
++        description="How to crop detected objects before resizing: 'square' (expand short edge to square), 'tight' (direct bbox warp), or 'letterbox' (aspect-preserving pad).",
++    )
++    crop_scale: float = Field(
++        default=1.0,
++        title="Crop scale",
++        description="Multiplier applied to the bounding box dimensions before cropping.",
++        ge=1.0,
++    )
+ 
+ 
+ class CustomClassificationConfig(FrigateBaseModel):
+@@ -179,6 +207,38 @@ class CustomClassificationConfig(FrigateBaseModel):
+         description="How many classification attempts to save for recent classifications UI.",
+         ge=0,
+     )
++    device: str | None = Field(
++        default=None,
++        title="Device Type",
++        description="Device for classification inference (e.g. 'AUTO', 'CPU', 'GPU', 'NPU', 'Tensorrt', 'edgetpu', 'usb', 'pci', '0').",
++    )
++    width: int = Field(
++        default=CLASSIFICATION_INPUT_SIZE[0],
++        gt=0,
++        title="Classification model input width",
++        description="Width of the model input tensor in pixels.",
++    )
++    height: int = Field(
++        default=CLASSIFICATION_INPUT_SIZE[1],
++        gt=0,
++        title="Classification model input height",
++        description="Height of the model input tensor in pixels.",
++    )
++    input_tensor: InputTensorEnum = Field(
++        default=InputTensorEnum.nhwc,
++        title="Model Input Tensor Shape",
++        description="Tensor format expected by the model: 'nhwc' or 'nchw'.",
++    )
++    input_pixel_format: ClassificationPixelFormatEnum = Field(
++        default=ClassificationPixelFormatEnum.rgb,
++        title="Model Input Pixel Color Format",
++        description="Pixel colorspace expected by the model: 'rgb' or 'bgr'.",
++    )
++    input_dtype: InputDTypeEnum = Field(
++        default=InputDTypeEnum.int,
++        title="Model Input D Type",
++        description="Data type of the model input tensor ('int', 'float', or 'float_denorm').",
++    )
+     object_config: CustomClassificationObjectConfig | None = Field(default=None)
+     state_config: CustomClassificationStateConfig | None = Field(default=None)
+ 
+diff --git a/frigate/const.py b/frigate/const.py
+index 7fa1457..c321bd0 100644
+--- a/frigate/const.py
++++ b/frigate/const.py
+@@ -202,3 +202,8 @@ PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
+ # Queues
+ 
+ FAST_QUEUE_TIMEOUT = 0.00001  # seconds
++
++# Classification
++
++CLASSIFICATION_INPUT_SIZE = (224, 224)
++CUSTOM_CLASSIFICATION_MODEL_TYPE = "custom_classification"
+diff --git a/frigate/data_processing/real_time/custom_classification.py b/frigate/data_processing/real_time/custom_classification.py
+index bcdc718..656671d 100644
+--- a/frigate/data_processing/real_time/custom_classification.py
++++ b/frigate/data_processing/real_time/custom_classification.py
+@@ -1,9 +1,10 @@
+-"""Real time processor that works with classification tflite models."""
++"""Real time processor for custom classification models."""
+ 
+ import datetime
+ import logging
+ import os
+ import time
++from abc import ABC, abstractmethod
+ from typing import Any
+ 
+ import cv2
+@@ -13,9 +14,19 @@ from frigate.comms.embeddings_updater import EmbeddingsRequestEnum
+ from frigate.comms.event_metadata_updater import EventMetadataPublisher
+ from frigate.comms.inter_process import InterProcessRequestor
+ from frigate.config import FrigateConfig
+-from frigate.config.classification import CustomClassificationConfig
+-from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
++from frigate.config.classification import (
++    ClassificationPixelFormatEnum,
++    CropStrategyEnum,
++    CustomClassificationConfig,
++)
++from frigate.const import (
++    CLIPS_DIR,
++    CUSTOM_CLASSIFICATION_MODEL_TYPE,
++    MODEL_CACHE_DIR,
++)
++from frigate.detectors.detector_config import InputDTypeEnum
+ from frigate.log import suppress_stderr_during
++from frigate.object_detection.util import tensor_transform
+ from frigate.util.builtin import EventsPerSecond, InferenceSpeed, load_labels
+ from frigate.util.classification import resize_classification_image
+ from frigate.util.file import trim_oldest_files
+@@ -25,39 +36,349 @@ from frigate.util.object import box_overlaps
+ from ..types import DataProcessorMetrics
+ from .api import DeferredRealtimeProcessorApi
+ 
+-try:
+-    from tflite_runtime.interpreter import Interpreter
+-except ModuleNotFoundError:
+-    from ai_edge_litert.interpreter import Interpreter
+-
+ logger = logging.getLogger(__name__)
+ 
+ MAX_OBJECT_CLASSIFICATIONS = 16
+ 
+ 
+-class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
++def _import_tflite() -> tuple[Any, Any]:
++    """Lazily import TFLite/LiteRT Interpreter and load_delegate."""
++    try:
++        from tflite_runtime.interpreter import Interpreter, load_delegate
++    except ModuleNotFoundError:
++        from ai_edge_litert.interpreter import Interpreter, load_delegate
++
++    return Interpreter, load_delegate
++
++
++def is_edgetpu_device(device: str | None) -> bool:
++    """Return True if device selects a Coral EdgeTPU delegate."""
++    dev = (device or "").strip().lower()
++    return dev in ("edgetpu", "usb", "pci") or dev.startswith(("usb:", "pci:"))
++
++
++def _crop_and_resize_object(
++    rgb: np.ndarray,
++    box: list[int] | tuple[int, int, int, int],
++    target_size: tuple[int, int],
++    strategy: CropStrategyEnum | str = CropStrategyEnum.square,
++    scale: float = 1.0,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Crop an object from an RGB frame and resize according to strategy."""
++    resolved_strategy = CropStrategyEnum(strategy)
++    img_h, img_w = rgb.shape[:2]
++    if img_h <= 0 or img_w <= 0:
++        raise ValueError("Empty input frame")
++
++    xmin, ymin, xmax, ymax = int(box[0]), int(box[1]), int(box[2]), int(box[3])
++    if resolved_strategy == CropStrategyEnum.square:
++        x, y, x2, y2 = calculate_region(
++            rgb.shape,
++            xmin,
++            ymin,
++            xmax,
++            ymax,
++            int(max(xmax - xmin, ymax - ymin) * scale),
++            1.0,
++        )
++        crop = rgb[y:y2, x:x2]
++    else:
++        cx = (xmin + xmax) / 2.0
++        cy = (ymin + ymax) / 2.0
++        half_w = (xmax - xmin) * scale / 2.0
++        half_h = (ymax - ymin) * scale / 2.0
++        x = max(0, min(img_w - 1, int(cx - half_w)))
++        y = max(0, min(img_h - 1, int(cy - half_h)))
++        x2 = min(img_w, max(x + 1, int(cx + half_w)))
++        y2 = min(img_h, max(y + 1, int(cy + half_h)))
++        crop = rgb[y:y2, x:x2]
++
++    if crop.size == 0:
++        raise ValueError("Empty crop region")
++
++    if resolved_strategy == CropStrategyEnum.letterbox:
++        tw, th = target_size
++        ch, cw = crop.shape[:2]
++        ratio = min(tw / max(1, cw), th / max(1, ch))
++        nw = max(1, int(round(cw * ratio)))
++        nh = max(1, int(round(ch * ratio)))
++        resized = cv2.resize(crop, (nw, nh))
++        canvas = np.zeros((th, tw, 3), dtype=np.uint8)
++        y_off = (th - nh) // 2
++        x_off = (tw - nw) // 2
++        canvas[y_off : y_off + nh, x_off : x_off + nw] = resized
++        return crop, canvas
++
++    return crop, resize_classification_image(crop, target_size)
++
++
++def _to_probabilities(raw: np.ndarray) -> np.ndarray:
++    """Convert raw float scores or logits into a 1D float64 probability vector."""
++    arr = np.asarray(raw, dtype=np.float64).ravel()
++    if arr.size == 0:
++        return arr
++    total = float(arr.sum())
++    if np.all(arr >= 0.0) and total > 0.0 and abs(total - 1.0) <= 1e-2:
++        return np.asarray(arr / total, dtype=np.float64)
++    exps = np.exp(arr - np.max(arr))
++    return np.asarray(exps / exps.sum(), dtype=np.float64)
++
++
++class ClassificationBackend(ABC):
++    """Runtime backend interface for custom classification models."""
++
++    backend_name: str
++    input_size: tuple[int, int]
++
++    def __init__(self, model_config: CustomClassificationConfig) -> None:
++        self.input_size = (int(model_config.width), int(model_config.height))
++        self.input_transform = tensor_transform(model_config.input_tensor)
++        self.input_pixel_format = model_config.input_pixel_format
++        self.input_dtype = model_config.input_dtype
++
++    def _prepare_input(self, resized_rgb: np.ndarray) -> np.ndarray:
++        """Format an RGB (H, W, 3) uint8 crop to match the model's declared input spec."""
++        img = (
++            cv2.cvtColor(resized_rgb, cv2.COLOR_RGB2BGR)
++            if self.input_pixel_format == ClassificationPixelFormatEnum.bgr
++            else resized_rgb
++        )
++        tensor_input: np.ndarray = np.expand_dims(img, axis=0)
++        if self.input_transform:
++            tensor_input = np.transpose(tensor_input, self.input_transform)
++        if self.input_dtype == InputDTypeEnum.float:
++            tensor_input = tensor_input.astype(np.float32) / 255.0
++        elif self.input_dtype == InputDTypeEnum.float_denorm:
++            tensor_input = tensor_input.astype(np.float32)
++        return tensor_input
++
++    def predict(self, resized_rgb: np.ndarray) -> np.ndarray:
++        """Run inference on an RGB crop sized to input_size and return 1D probabilities."""
++        return self._infer(self._prepare_input(resized_rgb))
++
++    @abstractmethod
++    def _infer(self, tensor_in: np.ndarray) -> np.ndarray:
++        """Run backend-specific inference on a formatted input tensor."""
++
++
++class TFLiteClassifierBackend(ClassificationBackend):
++    """TFLite / LiteRT backend supporting CPU and Coral EdgeTPU delegates."""
++
++    def __init__(
++        self, model_path: str, model_config: CustomClassificationConfig
++    ) -> None:
++        super().__init__(model_config)
++        Interpreter, load_delegate = _import_tflite()
++
++        delegates: list[Any] = []
++        dev = (model_config.device or "").strip().lower()
++        if is_edgetpu_device(dev):
++            delegate_opts = {} if dev == "edgetpu" else {"device": dev}
++            delegates = [load_delegate("libedgetpu.so.1.0", delegate_opts)]
++        elif dev and dev not in ("auto", "cpu"):
++            logger.warning(
++                "TFLite classification backend ignores device '%s' and runs on CPU",
++                model_config.device,
++            )
++
++        self.backend_name = "EdgeTPU" if delegates else "TFLite"
++        with suppress_stderr_during("tflite_interpreter_init"):
++            self.interpreter = Interpreter(
++                model_path=model_path,
++                num_threads=2,
++                experimental_delegates=delegates or None,
++            )
++            self.interpreter.allocate_tensors()
++        self.tensor_input_details = self.interpreter.get_input_details()
++        self.tensor_output_details = self.interpreter.get_output_details()
++        self._requires_int8_input = self.tensor_input_details[0].get("dtype") == np.int8
++        self._validate_input_details(model_path)
++
++    def _format_tflite_input(self, tensor_in: np.ndarray) -> np.ndarray:
++        if self._requires_int8_input and tensor_in.dtype == np.uint8:
++            return np.bitwise_xor(tensor_in, 128).view(np.int8)
++        return tensor_in
++
++    def _validate_input_details(self, model_path: str) -> None:
++        input_detail = self.tensor_input_details[0]
++        in_w, in_h = self.input_size
++        sample = self._format_tflite_input(
++            self._prepare_input(np.zeros((in_h, in_w, 3), dtype=np.uint8))
++        )
++
++        raw_shape = input_detail.get("shape")
++        if raw_shape is not None and len(raw_shape) > 0:
++            expected_shape = tuple(int(d) for d in raw_shape)
++            if len(expected_shape) != len(sample.shape) or not all(
++                e <= 0 or e == a for e, a in zip(expected_shape, sample.shape)
++            ):
++                raise ValueError(
++                    f"TFLite model {model_path} expects input shape {expected_shape}, "
++                    f"got {sample.shape} from config"
++                )
++
++        expected_dtype_raw = input_detail.get("dtype")
++        if expected_dtype_raw is not None:
++            expected_dtype = np.dtype(expected_dtype_raw)
++            if sample.dtype != expected_dtype:
++                raise ValueError(
++                    f"TFLite model {model_path} expects input dtype {expected_dtype}, "
++                    f"got {sample.dtype} from config"
++                )
++
++    def _decode_output(self, raw: np.ndarray) -> np.ndarray:
++        raw_arr = np.asarray(raw).ravel()
++        if raw_arr.size == 0:
++            return np.array([], dtype=np.float64)
++
++        output_detail = self.tensor_output_details[0]
++        quant = output_detail.get("quantization") or (0.0, 0)
++        scale, zero_point = quant
++
++        if np.issubdtype(raw_arr.dtype, np.integer):
++            if scale:
++                info = np.iinfo(raw_arr.dtype)
++                min_val = (info.min - zero_point) * scale
++                max_val = (info.max - zero_point) * scale
++                dequant = (raw_arr.astype(np.float64) - zero_point) * scale
++                if min_val >= -1e-3 and max_val <= 1.0 + 1e-2:
++                    clipped = np.maximum(dequant, 0.0)
++                    total = float(clipped.sum())
++                    return np.asarray(
++                        clipped / total if total > 0.0 else clipped,
++                        dtype=np.float64,
++                    )
++                return _to_probabilities(dequant)
++            if np.issubdtype(raw_arr.dtype, np.unsignedinteger):
++                arr = raw_arr.astype(np.float64)
++                total = float(arr.sum())
++                return np.asarray(arr / total if total > 0.0 else arr, dtype=np.float64)
++            return _to_probabilities(raw_arr)
++
++        return _to_probabilities(raw_arr)
++
++    def _infer(self, tensor_in: np.ndarray) -> np.ndarray:
++        tensor_in = self._format_tflite_input(tensor_in)
++        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], tensor_in)
++        self.interpreter.invoke()
++        raw = np.asarray(
++            self.interpreter.get_tensor(self.tensor_output_details[0]["index"])
++        )
++        if raw.ndim > 1:
++            raw = raw[0]
++        return self._decode_output(raw)
++
++
++class ONNXClassifierBackend(ClassificationBackend):
++    """ONNX Runtime backend delegating runner selection to Frigate's factory."""
++
++    def __init__(
++        self, model_path: str, model_config: CustomClassificationConfig
++    ) -> None:
++        super().__init__(model_config)
++        from frigate.detectors.detection_runners import get_optimized_runner
++
++        raw_dev = (model_config.device or "").strip()
++        upper_dev = raw_dev.upper()
++        if not raw_dev:
++            device = "AUTO"
++        elif upper_dev in ("AUTO", "CPU", "GPU", "NPU") or upper_dev.startswith(
++            ("GPU.", "CPU.")
++        ):
++            device = upper_dev
++        elif upper_dev == "TENSORRT":
++            device = "Tensorrt"
++        else:
++            device = raw_dev
++
++        self.runner = get_optimized_runner(
++            model_path,
++            device=device,
++            model_type=CUSTOM_CLASSIFICATION_MODEL_TYPE,
++        )
++        self.backend_name = self.runner.device_name
++        self.input_name = self.runner.get_input_names()[0]
++
++        in_w, in_h = self.input_size
++        self._infer(self._prepare_input(np.zeros((in_h, in_w, 3), dtype=np.uint8)))
++
++    def _infer(self, tensor_in: np.ndarray) -> np.ndarray:
++        outputs = self.runner.run({self.input_name: tensor_in})
++        if not outputs:
++            return np.array([], dtype=np.float64)
++        raw = np.asarray(outputs[0])
++        if raw.ndim > 1:
++            raw = raw[0]
++        return _to_probabilities(raw)
++
++
++def load_classification_backend(
++    model_dir: str,
++    model_config: CustomClassificationConfig,
++) -> tuple[ClassificationBackend | None, dict[int, str]]:
++    """Load the classification backend matching model_config and labelmap."""
++    labelmap_path = os.path.join(model_dir, "labelmap.txt")
++    if not os.path.exists(labelmap_path):
++        return None, {}
++
++    onnx_path = os.path.join(model_dir, "model.onnx")
++    tflite_path = os.path.join(model_dir, "model.tflite")
++
++    backend: ClassificationBackend
++    if is_edgetpu_device(model_config.device):
++        if os.path.exists(tflite_path):
++            backend = TFLiteClassifierBackend(tflite_path, model_config)
++        else:
++            if os.path.exists(onnx_path):
++                logger.error(
++                    "EdgeTPU device '%s' requires model.tflite for %s, but only model.onnx is present",
++                    model_config.device,
++                    model_config.name,
++                )
++            return None, {}
++    elif os.path.exists(onnx_path):
++        backend = ONNXClassifierBackend(onnx_path, model_config)
++    elif os.path.exists(tflite_path):
++        backend = TFLiteClassifierBackend(tflite_path, model_config)
++    else:
++        return None, {}
++
++    return backend, load_labels(labelmap_path, prefill=0, indexed=False)
++
++
++class _BaseCustomClassificationProcessor(DeferredRealtimeProcessorApi):
++    """Shared deferred lifecycle, backend loading, and prediction for custom classifiers."""
++
++    _classifier_kind: str
++    _BACKEND_CONFIG_FIELDS = (
++        "device",
++        "width",
++        "height",
++        "input_tensor",
++        "input_pixel_format",
++        "input_dtype",
++    )
++
+     def __init__(
+         self,
+         config: FrigateConfig,
+         model_config: CustomClassificationConfig,
+         requestor: InterProcessRequestor,
+         metrics: DataProcessorMetrics,
+-    ):
++        max_queue: int,
++    ) -> None:
+         if not model_config.name:
+             raise ValueError("Custom classification model name must be set.")
+ 
+-        super().__init__(config, metrics, max_queue=4)
++        super().__init__(config, metrics, max_queue=max_queue)
+         self.model_config = model_config
+ 
+         self.requestor = requestor
+         self.model_dir = os.path.join(MODEL_CACHE_DIR, model_config.name)
+         self.train_dir = os.path.join(CLIPS_DIR, model_config.name, "train")
+-        self.interpreter: Interpreter | None = None
+-        self.tensor_input_details: list[dict[str, Any]] | None = None
+-        self.tensor_output_details: list[dict[str, Any]] | None = None
++        self.backend: ClassificationBackend | None = None
+         self.labelmap: dict[int, str] = {}
+         self.classifications_per_second = EventsPerSecond()
+-        self.state_history: dict[str, dict[str, Any]] = {}
+ 
+         if self.metrics and model_config.name in self.metrics.classification_speeds:
+             self.inference_speed: InferenceSpeed | None = InferenceSpeed(
+@@ -66,35 +387,135 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         else:
+             self.inference_speed = None
+ 
+-        # monotonic so a backward wall clock step can't pause classification
+-        self.last_run = time.monotonic()
++    def _initialize_detector(self) -> None:
+         try:
+-            self.__build_detector()
++            self._build_detector()
+         except Exception:
+             self.shutdown()
+             raise
+ 
+-    def __build_detector(self) -> None:
+-        model_path = os.path.join(self.model_dir, "model.tflite")
+-        labelmap_path = os.path.join(self.model_dir, "labelmap.txt")
++    def _build_detector(self) -> None:
++        self.backend = None
++        self.labelmap = {}
++        self.backend, self.labelmap = load_classification_backend(
++            self.model_dir, self.model_config
++        )
++        if self.backend is not None:
++            logger.info(
++                "Loaded %s %s classifier (%dx%d) for %s",
++                self.backend.backend_name,
++                self._classifier_kind,
++                self.backend.input_size[0],
++                self.backend.input_size[1],
++                self.model_config.name,
++            )
++            self._on_backend_loaded()
+ 
+-        if not os.path.exists(model_path) or not os.path.exists(labelmap_path):
+-            self.interpreter = None
+-            self.tensor_input_details = None
+-            self.tensor_output_details = None
+-            self.labelmap = {}
+-            return
++    def _on_backend_loaded(self) -> None:
++        """Hook executed after a backend loads during initialization or reload."""
+ 
+-        # Suppress TFLite delegate creation messages that bypass Python logging
+-        with suppress_stderr_during("tflite_interpreter_init"):
+-            self.interpreter = Interpreter(
+-                model_path=model_path,
+-                num_threads=2,
++    def _update_metrics(self, duration: float) -> None:
++        self.classifications_per_second.update()
++        if self.inference_speed:
++            self.inference_speed.update(duration)
++
++    def _publish_cps_metric(self) -> None:
++        if (
++            self.metrics
++            and self.model_config.name
++            and self.model_config.name in self.metrics.classification_cps
++        ):
++            self.metrics.classification_cps[
++                self.model_config.name
++            ].value = self.classifications_per_second.eps()
++
++    def _target_size(self) -> tuple[int, int]:
++        return (int(self.model_config.width), int(self.model_config.height))
++
++    def _save_attempts_limit(self, default: int) -> int:
++        return (
++            self.model_config.save_attempts
++            if self.model_config.save_attempts is not None
++            else default
++        )
++
++    def _predict_top_class(
++        self, resized_rgb: np.ndarray, timestamp: float
++    ) -> tuple[str, float] | None:
++        if self.backend is None:
++            return None
++
++        probs = self.backend.predict(resized_rgb)
++        if probs.size == 0:
++            return None
++
++        logger.debug(
++            "%s Ran %s classification with probabilities: %s",
++            self.model_config.name,
++            self._classifier_kind,
++            probs,
++        )
++        best_id = int(np.argmax(probs))
++        score = round(float(probs[best_id]), 2)
++        self._update_metrics(datetime.datetime.now().timestamp() - timestamp)
++        return self.labelmap[best_id], score
++
++    def update_model_config(self, model_config: CustomClassificationConfig) -> None:
++        """Apply updated config on the worker thread, reloading the backend when needed."""
++
++        def _apply(new_config: CustomClassificationConfig) -> None:
++            backend_changed = any(
++                getattr(new_config, field) != getattr(self.model_config, field)
++                for field in self._BACKEND_CONFIG_FIELDS
+             )
+-            self.interpreter.allocate_tensors()
+-        self.tensor_input_details = self.interpreter.get_input_details()
+-        self.tensor_output_details = self.interpreter.get_output_details()
+-        self.labelmap = load_labels(labelmap_path, prefill=0, indexed=False)
++            self.model_config = new_config
++            if backend_changed:
++                self._build_detector()
++
++        self._enqueue_request(_apply, model_config)
++
++    def handle_request(
++        self, topic: str, request_data: dict[str, Any]
++    ) -> dict[str, Any] | None:
++        if (
++            topic == EmbeddingsRequestEnum.reload_classification_model.value
++            and request_data.get("model_name") == self.model_config.name
++        ):
++
++            def _do_reload(data: dict[str, Any]) -> dict[str, Any]:
++                self._build_detector()
++                logger.info(
++                    "Successfully loaded updated model for %s",
++                    self.model_config.name,
++                )
++                return {
++                    "success": True,
++                    "message": f"Loaded {self.model_config.name} model.",
++                }
++
++            result: dict[str, Any] = self._enqueue_request(_do_reload, request_data)
++            return result
++
++        return None
++
++
++class CustomStateClassificationProcessor(_BaseCustomClassificationProcessor):
++    _classifier_kind = "state"
++
++    def __init__(
++        self,
++        config: FrigateConfig,
++        model_config: CustomClassificationConfig,
++        requestor: InterProcessRequestor,
++        metrics: DataProcessorMetrics,
++    ):
++        super().__init__(config, model_config, requestor, metrics, max_queue=4)
++        self.state_history: dict[str, dict[str, Any]] = {}
++        # monotonic so a backward wall clock step can't pause classification
++        self.last_run = time.monotonic()
++        self._initialize_detector()
++
++    def _on_backend_loaded(self) -> None:
+         self._forget_unknown_states()
+         self.classifications_per_second.start()
+ 
+@@ -112,11 +533,6 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+             if history["current_state"] in labels
+         }
+ 
+-    def __update_metrics(self, duration: float) -> None:
+-        self.classifications_per_second.update()
+-        if self.inference_speed:
+-            self.inference_speed.update(duration)
+-
+     def _should_save_image(
+         self, camera: str, detected_state: str, score: float = 1.0
+     ) -> bool:
+@@ -200,10 +616,7 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         if not self.model_config.name or not self.model_config.state_config:
+             return
+ 
+-        if self.metrics and self.model_config.name in self.metrics.classification_cps:
+-            self.metrics.classification_cps[
+-                self.model_config.name
+-            ].value = self.classifications_per_second.eps()
++        self._publish_cps_metric()
+         camera = str(frame_data.get("camera"))
+ 
+         if camera not in self.model_config.state_config.cameras:
+@@ -277,8 +690,10 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         cropped_frame = rgb[y1:y2, x1:x2]
+ 
+         try:
+-            resized_frame = resize_classification_image(cropped_frame)
+-        except Exception:
++            resized_frame = resize_classification_image(
++                cropped_frame, self._target_size()
++            )
++        except (cv2.error, ValueError):
+             logger.warning("Failed to resize image for state classification")
+             return
+ 
+@@ -288,12 +703,9 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         self._enqueue_task(("classify", camera, now, resized_frame, crop_bgr))
+ 
+     def _process_task(self, task: Any) -> None:
+-        kind = task[0]
+-        if kind == "classify":
++        if task[0] == "classify":
+             _, camera, timestamp, resized_frame, crop_bgr = task
+             self._classify_state(camera, timestamp, resized_frame, crop_bgr)
+-        elif kind == "reload":
+-            self.__build_detector()
+ 
+     def _classify_state(
+         self,
+@@ -302,14 +714,9 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         resized_frame: np.ndarray,
+         crop_bgr: np.ndarray,
+     ) -> None:
+-        if self.interpreter is None:
+-            # When interpreter is None, always save (score is 0.0, which is < 1.0)
++        if self.backend is None:
++            # When backend is None, always save (score is 0.0, which is < 1.0)
+             if self._should_save_image(camera, "unknown", 0.0):
+-                save_attempts = (
+-                    self.model_config.save_attempts
+-                    if self.model_config.save_attempts is not None
+-                    else 100
+-                )
+                 write_classification_attempt(
+                     self.train_dir,
+                     crop_bgr,
+@@ -317,35 +724,16 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+                     timestamp,
+                     "unknown",
+                     0.0,
+-                    max_files=save_attempts,
++                    max_files=self._save_attempts_limit(100),
+                 )
+             return
+ 
+-        if not self.tensor_input_details or not self.tensor_output_details:
++        prediction = self._predict_top_class(resized_frame, timestamp)
++        if prediction is None:
+             return
+-
+-        input = np.expand_dims(resized_frame, axis=0)
+-        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], input)
+-        self.interpreter.invoke()
+-        res: np.ndarray = self.interpreter.get_tensor(
+-            self.tensor_output_details[0]["index"]
+-        )[0]
+-        probs = res / res.sum(axis=0)
+-        logger.debug(
+-            f"{self.model_config.name} Ran state classification with probabilities: {probs}"
+-        )
+-        best_id = int(np.argmax(probs))
+-        score = round(probs[best_id], 2)
+-        self.__update_metrics(datetime.datetime.now().timestamp() - timestamp)
+-
+-        detected_state = self.labelmap[best_id]
++        detected_state, score = prediction
+ 
+         if self._should_save_image(camera, detected_state, score):
+-            save_attempts = (
+-                self.model_config.save_attempts
+-                if self.model_config.save_attempts is not None
+-                else 100
+-            )
+             write_classification_attempt(
+                 self.train_dir,
+                 crop_bgr,
+@@ -353,7 +741,7 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+                 timestamp,
+                 detected_state,
+                 score,
+-                max_files=save_attempts,
++                max_files=self._save_attempts_limit(100),
+             )
+ 
+         if score < self.model_config.threshold:
+@@ -378,34 +766,13 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+                 }
+             )
+ 
+-    def handle_request(
+-        self, topic: str, request_data: dict[str, Any]
+-    ) -> dict[str, Any] | None:
+-        if topic == EmbeddingsRequestEnum.reload_classification_model.value:
+-            if request_data.get("model_name") == self.model_config.name:
+-
+-                def _do_reload(data: dict[str, Any]) -> dict[str, Any]:
+-                    self.__build_detector()
+-                    logger.info(
+-                        f"Successfully loaded updated model for {self.model_config.name}"
+-                    )
+-                    return {
+-                        "success": True,
+-                        "message": f"Loaded {self.model_config.name} model.",
+-                    }
+-
+-                result: dict[str, Any] = self._enqueue_request(_do_reload, request_data)
+-                return result
+-            else:
+-                return None
+-        else:
+-            return None
+-
+     def expire_object(self, object_id: str, camera: str) -> None:
+         pass
+ 
+ 
+-class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
++class CustomObjectClassificationProcessor(_BaseCustomClassificationProcessor):
++    _classifier_kind = "object"
++
+     def __init__(
+         self,
+         config: FrigateConfig,
+@@ -414,62 +781,10 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         requestor: InterProcessRequestor,
+         metrics: DataProcessorMetrics,
+     ):
+-        if not model_config.name:
+-            raise ValueError("Custom classification model name must be set.")
+-
+-        super().__init__(config, metrics, max_queue=8)
+-        self.model_config = model_config
+-
+-        self.model_dir = os.path.join(MODEL_CACHE_DIR, model_config.name)
+-        self.train_dir = os.path.join(CLIPS_DIR, model_config.name, "train")
+-        self.interpreter: Interpreter | None = None
++        super().__init__(config, model_config, requestor, metrics, max_queue=8)
+         self.sub_label_publisher = sub_label_publisher
+-        self.requestor = requestor
+-        self.tensor_input_details: list[dict[str, Any]] | None = None
+-        self.tensor_output_details: list[dict[str, Any]] | None = None
+         self.classification_history: dict[str, list[tuple[str, float, float]]] = {}
+-        self.labelmap: dict[int, str] = {}
+-        self.classifications_per_second = EventsPerSecond()
+-
+-        if self.metrics and model_config.name in self.metrics.classification_speeds:
+-            self.inference_speed: InferenceSpeed | None = InferenceSpeed(
+-                self.metrics.classification_speeds[model_config.name]
+-            )
+-        else:
+-            self.inference_speed = None
+-
+-        try:
+-            self.__build_detector()
+-        except Exception:
+-            self.shutdown()
+-            raise
+-
+-    def __build_detector(self) -> None:
+-        model_path = os.path.join(self.model_dir, "model.tflite")
+-        labelmap_path = os.path.join(self.model_dir, "labelmap.txt")
+-
+-        if not os.path.exists(model_path) or not os.path.exists(labelmap_path):
+-            self.interpreter = None
+-            self.tensor_input_details = None
+-            self.tensor_output_details = None
+-            self.labelmap = {}
+-            return
+-
+-        # Suppress TFLite delegate creation messages that bypass Python logging
+-        with suppress_stderr_during("tflite_interpreter_init"):
+-            self.interpreter = Interpreter(
+-                model_path=model_path,
+-                num_threads=2,
+-            )
+-            self.interpreter.allocate_tensors()
+-        self.tensor_input_details = self.interpreter.get_input_details()
+-        self.tensor_output_details = self.interpreter.get_output_details()
+-        self.labelmap = load_labels(labelmap_path, prefill=0, indexed=False)
+-
+-    def __update_metrics(self, duration: float) -> None:
+-        self.classifications_per_second.update()
+-        if self.inference_speed:
+-            self.inference_speed.update(duration)
++        self._initialize_detector()
+ 
+     def get_weighted_score(
+         self,
+@@ -488,7 +803,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             logger.debug(f"Created new classification history for {object_id}")
+ 
+         self.classification_history[object_id].append(
+-            (current_label, current_score, current_time)
++            (current_label, float(current_score), current_time)
+         )
+ 
+         history = self.classification_history[object_id]
+@@ -506,7 +821,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         label_scores: dict[str, list[float]] = {}
+         total_attempts = len(history)
+ 
+-        for label, score, timestamp in history:
++        for label, score, _timestamp in history:
+             if label not in label_counts:
+                 label_counts[label] = 0
+                 label_scores[label] = []
+@@ -530,7 +845,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             )
+             return None, 0.0
+ 
+-        avg_score = sum(label_scores[best_label]) / len(label_scores[best_label])
++        avg_score = float(sum(label_scores[best_label]) / len(label_scores[best_label]))
+ 
+         if best_label == "none":
+             logger.debug(f"Filtering 'none' label for {object_id}")
+@@ -545,10 +860,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         if not self.model_config.name or not self.model_config.object_config:
+             return
+ 
+-        if self.metrics and self.model_config.name in self.metrics.classification_cps:
+-            self.metrics.classification_cps[
+-                self.model_config.name
+-            ].value = self.classifications_per_second.eps()
++        self._publish_cps_metric()
+ 
+         if obj_data["false_positive"]:
+             return
+@@ -569,25 +881,17 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             return
+ 
+         now = datetime.datetime.now().timestamp()
+-        x, y, x2, y2 = calculate_region(
+-            frame.shape,
+-            obj_data["box"][0],
+-            obj_data["box"][1],
+-            obj_data["box"][2],
+-            obj_data["box"][3],
+-            max(
+-                obj_data["box"][2] - obj_data["box"][0],
+-                obj_data["box"][3] - obj_data["box"][1],
+-            ),
+-            1.0,
+-        )
+-
+         rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
+-        crop = rgb[y:y2, x:x2]
+ 
+         try:
+-            resized_crop = resize_classification_image(crop)
+-        except Exception:
++            crop, resized_crop = _crop_and_resize_object(
++                rgb,
++                obj_data["box"],
++                self._target_size(),
++                strategy=self.model_config.object_config.crop_strategy,
++                scale=self.model_config.object_config.crop_scale,
++            )
++        except (cv2.error, ValueError):
+             logger.warning("Failed to resize image for object classification")
+             return
+ 
+@@ -607,8 +911,6 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             _, object_id = task
+             if object_id in self.classification_history:
+                 self.classification_history.pop(object_id)
+-        elif kind == "reload":
+-            self.__build_detector()
+ 
+     def _classify_object(
+         self,
+@@ -618,12 +920,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         resized_crop: np.ndarray,
+         crop_bgr: np.ndarray,
+     ) -> None:
+-        if self.interpreter is None:
+-            save_attempts = (
+-                self.model_config.save_attempts
+-                if self.model_config.save_attempts is not None
+-                else 200
+-            )
++        if self.backend is None:
+             write_classification_attempt(
+                 self.train_dir,
+                 crop_bgr,
+@@ -631,7 +928,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+                 timestamp,
+                 "unknown",
+                 0.0,
+-                max_files=save_attempts,
++                max_files=self._save_attempts_limit(200),
+             )
+ 
+             # Still track history even when model doesn't exist to respect MAX_OBJECT_CLASSIFICATIONS
+@@ -642,36 +939,19 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             self.classification_history[object_id].append(("unknown", 0.0, timestamp))
+             return
+ 
+-        if not self.tensor_input_details or not self.tensor_output_details:
++        prediction = self._predict_top_class(resized_crop, timestamp)
++        if prediction is None:
+             return
++        sub_label, score = prediction
+ 
+-        input = np.expand_dims(resized_crop, axis=0)
+-        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], input)
+-        self.interpreter.invoke()
+-        res: np.ndarray = self.interpreter.get_tensor(
+-            self.tensor_output_details[0]["index"]
+-        )[0]
+-        probs = res / res.sum(axis=0)
+-        logger.debug(
+-            f"{self.model_config.name} Ran object classification with probabilities: {probs}"
+-        )
+-        best_id = int(np.argmax(probs))
+-        score = round(probs[best_id], 2)
+-        self.__update_metrics(datetime.datetime.now().timestamp() - timestamp)
+-
+-        save_attempts = (
+-            self.model_config.save_attempts
+-            if self.model_config.save_attempts is not None
+-            else 200
+-        )
+         write_classification_attempt(
+             self.train_dir,
+             crop_bgr,
+             object_id,
+             timestamp,
+-            self.labelmap[best_id],
++            sub_label,
+             score,
+-            max_files=save_attempts,
++            max_files=self._save_attempts_limit(200),
+         )
+ 
+         if score < self.model_config.threshold:
+@@ -680,8 +960,6 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+             )
+             return
+ 
+-        sub_label = self.labelmap[best_id]
+-
+         logger.debug(
+             f"{self.model_config.name}: Object {object_id} passed threshold with sub_label={sub_label}, score={score}"
+         )
+@@ -709,29 +987,6 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+                 }
+             )
+ 
+-    def handle_request(
+-        self, topic: str, request_data: dict[str, Any]
+-    ) -> dict[str, Any] | None:
+-        if topic == EmbeddingsRequestEnum.reload_classification_model.value:
+-            if request_data.get("model_name") == self.model_config.name:
+-
+-                def _do_reload(data: dict[str, Any]) -> dict[str, Any]:
+-                    self.__build_detector()
+-                    logger.info(
+-                        f"Successfully loaded updated model for {self.model_config.name}"
+-                    )
+-                    return {
+-                        "success": True,
+-                        "message": f"Loaded {self.model_config.name} model.",
+-                    }
+-
+-                result: dict[str, Any] = self._enqueue_request(_do_reload, request_data)
+-                return result
+-            else:
+-                return None
+-        else:
+-            return None
+-
+     def expire_object(self, object_id: str, camera: str) -> None:
+         self._enqueue_task(("expire", object_id))
+ 
+diff --git a/frigate/detectors/detection_runners.py b/frigate/detectors/detection_runners.py
+index 0a14a59..7caf293 100644
+--- a/frigate/detectors/detection_runners.py
++++ b/frigate/detectors/detection_runners.py
+@@ -10,7 +10,7 @@ from typing import Any
+ import numpy as np
+ import onnxruntime as ort
+ 
+-from frigate.const import MODEL_CACHE_DIR
++from frigate.const import CUSTOM_CLASSIFICATION_MODEL_TYPE, MODEL_CACHE_DIR
+ from frigate.util.model import get_ort_providers
+ from frigate.util.rknn_converter import auto_convert_model, is_rknn_compatible
+ 
+@@ -147,7 +147,10 @@ def get_ort_session_options(
+         EnrichmentModelTypeEnum,
+     )
+ 
+-    if model_type not in ENRICHMENT_FOR_MODEL_TYPE:
++    if (
++        model_type not in ENRICHMENT_FOR_MODEL_TYPE
++        and model_type != CUSTOM_CLASSIFICATION_MODEL_TYPE
++    ):
+         return None
+ 
+     sess_options = ort.SessionOptions()
+@@ -337,6 +340,7 @@ class CudaGraphRunner(BaseModelRunner):
+             EnrichmentModelTypeEnum.jina_v1.value,
+             EnrichmentModelTypeEnum.jina_v2.value,
+             EnrichmentModelTypeEnum.yolov9_license_plate.value,
++            CUSTOM_CLASSIFICATION_MODEL_TYPE,
+         ]
+ 
+     # ORT performs two regular runs before it starts capturing, but on some
+diff --git a/frigate/embeddings/maintainer.py b/frigate/embeddings/maintainer.py
+index 2b7f6a8..053ca34 100644
+--- a/frigate/embeddings/maintainer.py
++++ b/frigate/embeddings/maintainer.py
+@@ -453,7 +453,15 @@ class EmbeddingMaintainer(threading.Thread):
+                 and processor.model_config.name == model_name
+             ):
+                 if isinstance(processor, expected_type):
+-                    processor.model_config = model_config
++                    try:
++                        processor.update_model_config(model_config)
++                    except Exception:
++                        logger.exception(
++                            "Failed to update classification processor %s",
++                            model_name,
++                        )
++                        return
++
+                     logger.debug(
+                         f"Updated config for classification processor: {model_name}"
+                     )
+diff --git a/frigate/util/classification.py b/frigate/util/classification.py
+index 6fa2036..0b25498 100644
+--- a/frigate/util/classification.py
++++ b/frigate/util/classification.py
+@@ -16,6 +16,7 @@ from frigate.comms.embeddings_updater import EmbeddingsRequestEnum, EmbeddingsRe
+ from frigate.comms.inter_process import InterProcessRequestor
+ from frigate.config import FfmpegConfig
+ from frigate.const import (
++    CLASSIFICATION_INPUT_SIZE,
+     CLIPS_DIR,
+     MODEL_CACHE_DIR,
+     PROCESS_PRIORITY_LOW,
+@@ -39,18 +40,19 @@ BATCH_SIZE = 16
+ EPOCHS = 50
+ LEARNING_RATE = 0.001
+ TRAINING_METADATA_FILE = ".training_metadata.json"
+-CLASSIFICATION_INPUT_SIZE = (224, 224)
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def resize_classification_image(image: np.ndarray) -> np.ndarray:
++def resize_classification_image(
++    image: np.ndarray, size: tuple[int, int] = CLASSIFICATION_INPUT_SIZE
++) -> np.ndarray:
+     """Resize an image to the classification model input size.
+ 
+     Training and inference both need to use this, otherwise the model is
+     trained on different pixels than the ones it is later run on.
+     """
+-    return cv2.resize(image, CLASSIFICATION_INPUT_SIZE)
++    return cv2.resize(image, size)
+ 
+ 
+ def prepare_training_dataset(dataset_dir: str, output_dir: str) -> None:

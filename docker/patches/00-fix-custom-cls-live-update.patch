@@ -1,0 +1,172 @@
+diff --git a/frigate/data_processing/real_time/custom_classification.py b/frigate/data_processing/real_time/custom_classification.py
+index 7b5ab74..bcdc718 100644
+--- a/frigate/data_processing/real_time/custom_classification.py
++++ b/frigate/data_processing/real_time/custom_classification.py
+@@ -43,15 +43,15 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         requestor: InterProcessRequestor,
+         metrics: DataProcessorMetrics,
+     ):
++        if not model_config.name:
++            raise ValueError("Custom classification model name must be set.")
++
+         super().__init__(config, metrics, max_queue=4)
+         self.model_config = model_config
+ 
+-        if not self.model_config.name:
+-            raise ValueError("Custom classification model name must be set.")
+-
+         self.requestor = requestor
+-        self.model_dir = os.path.join(MODEL_CACHE_DIR, self.model_config.name)
+-        self.train_dir = os.path.join(CLIPS_DIR, self.model_config.name, "train")
++        self.model_dir = os.path.join(MODEL_CACHE_DIR, model_config.name)
++        self.train_dir = os.path.join(CLIPS_DIR, model_config.name, "train")
+         self.interpreter: Interpreter | None = None
+         self.tensor_input_details: list[dict[str, Any]] | None = None
+         self.tensor_output_details: list[dict[str, Any]] | None = None
+@@ -59,19 +59,20 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
+         self.classifications_per_second = EventsPerSecond()
+         self.state_history: dict[str, dict[str, Any]] = {}
+ 
+-        if (
+-            self.metrics
+-            and self.model_config.name in self.metrics.classification_speeds
+-        ):
++        if self.metrics and model_config.name in self.metrics.classification_speeds:
+             self.inference_speed: InferenceSpeed | None = InferenceSpeed(
+-                self.metrics.classification_speeds[self.model_config.name]
++                self.metrics.classification_speeds[model_config.name]
+             )
+         else:
+             self.inference_speed = None
+ 
+         # monotonic so a backward wall clock step can't pause classification
+         self.last_run = time.monotonic()
+-        self.__build_detector()
++        try:
++            self.__build_detector()
++        except Exception:
++            self.shutdown()
++            raise
+ 
+     def __build_detector(self) -> None:
+         model_path = os.path.join(self.model_dir, "model.tflite")
+@@ -413,14 +414,14 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         requestor: InterProcessRequestor,
+         metrics: DataProcessorMetrics,
+     ):
++        if not model_config.name:
++            raise ValueError("Custom classification model name must be set.")
++
+         super().__init__(config, metrics, max_queue=8)
+         self.model_config = model_config
+ 
+-        if not self.model_config.name:
+-            raise ValueError("Custom classification model name must be set.")
+-
+-        self.model_dir = os.path.join(MODEL_CACHE_DIR, self.model_config.name)
+-        self.train_dir = os.path.join(CLIPS_DIR, self.model_config.name, "train")
++        self.model_dir = os.path.join(MODEL_CACHE_DIR, model_config.name)
++        self.train_dir = os.path.join(CLIPS_DIR, model_config.name, "train")
+         self.interpreter: Interpreter | None = None
+         self.sub_label_publisher = sub_label_publisher
+         self.requestor = requestor
+@@ -430,17 +431,18 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
+         self.labelmap: dict[int, str] = {}
+         self.classifications_per_second = EventsPerSecond()
+ 
+-        if (
+-            self.metrics
+-            and self.model_config.name in self.metrics.classification_speeds
+-        ):
++        if self.metrics and model_config.name in self.metrics.classification_speeds:
+             self.inference_speed: InferenceSpeed | None = InferenceSpeed(
+-                self.metrics.classification_speeds[self.model_config.name]
++                self.metrics.classification_speeds[model_config.name]
+             )
+         else:
+             self.inference_speed = None
+ 
+-        self.__build_detector()
++        try:
++            self.__build_detector()
++        except Exception:
++            self.shutdown()
++            raise
+ 
+     def __build_detector(self) -> None:
+         model_path = os.path.join(self.model_dir, "model.tflite")
+diff --git a/frigate/embeddings/maintainer.py b/frigate/embeddings/maintainer.py
+index 10e1e85..2b7f6a8 100644
+--- a/frigate/embeddings/maintainer.py
++++ b/frigate/embeddings/maintainer.py
+@@ -435,6 +435,12 @@ class EmbeddingMaintainer(threading.Thread):
+             logger.info(f"Disabled classification processor for model: {model_name}")
+             return
+ 
++        expected_type = (
++            CustomStateClassificationProcessor
++            if model_config.state_config is not None
++            else CustomObjectClassificationProcessor
++        )
++
+         for processor in self.realtime_processors:
+             if (
+                 isinstance(
+@@ -446,28 +452,39 @@ class EmbeddingMaintainer(threading.Thread):
+                 )
+                 and processor.model_config.name == model_name
+             ):
+-                processor.model_config = model_config
+-                logger.debug(
+-                    f"Updated config for classification processor: {model_name}"
+-                )
+-                return
++                if isinstance(processor, expected_type):
++                    processor.model_config = model_config
++                    logger.debug(
++                        f"Updated config for classification processor: {model_name}"
++                    )
++                    return
+ 
+-        if model_config.state_config is not None:
+-            processor = CustomStateClassificationProcessor(
+-                self.config, model_config, self.requestor, self.metrics
+-            )
+-        else:
+-            processor = CustomObjectClassificationProcessor(
+-                self.config,
+-                model_config,
+-                self.event_metadata_publisher,
+-                self.requestor,
+-                self.metrics,
++                self._remove_custom_classification_processor(model_name)
++                break
++
++        new_processor: RealTimeProcessorApi
++        try:
++            if model_config.state_config is not None:
++                new_processor = CustomStateClassificationProcessor(
++                    self.config, model_config, self.requestor, self.metrics
++                )
++            else:
++                new_processor = CustomObjectClassificationProcessor(
++                    self.config,
++                    model_config,
++                    self.event_metadata_publisher,
++                    self.requestor,
++                    self.metrics,
++                )
++        except Exception:
++            logger.exception(
++                "Failed to initialize classification processor %s", model_name
+             )
++            return
+ 
+-        self.realtime_processors.append(processor)
++        self.realtime_processors.append(new_processor)
+         logger.info(
+-            f"Added classification processor for model: {model_name} (type: {type(processor).__name__})"
++            f"Added classification processor for model: {model_name} (type: {type(new_processor).__name__})"
+         )
+ 
+     def _process_requests(self) -> None:

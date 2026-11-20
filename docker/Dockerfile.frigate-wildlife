@@ -1,0 +1,29 @@
+# Overlay Dockerfile that applies the custom ONNX classifier, YUV subcrop,
+# SpeciesNet geographic rollup, and reject_labels patches onto Frigate 0.19.0-dev (1c30924).
+#
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.frigate-wildlife -t frigate:wildlife .
+#
+# To layer on top of a custom base image (e.g. a CUDA 13 / TensorRT build):
+#   docker build --build-arg BASE_IMAGE=frigate:dev-cuda13-trt \
+#     -f docker/Dockerfile.frigate-wildlife -t frigate:wildlife-cuda13 .
+
+ARG BASE_IMAGE=ghcr.io/blakeblackshear/frigate@sha256:113780104ac5c0558d9d7ef34f2f32b4078beae3148bb2360c4906fa172084ed
+FROM ${BASE_IMAGE}
+
+# Refuse to patch a different Frigate version with these version-specific diffs (0.19.0-1c30924).
+RUN echo '7c7daa68083becedb73ec8946478d32dec5339c87cddc555c8506822f0d6c5d7  /opt/frigate/frigate/const.py' | sha256sum -c - \
+ && echo '95d288eed0778bafbfd007c1fe83af6a9e26d365436209f0e9656f3c6083180b  /opt/frigate/frigate/config/classification.py' | sha256sum -c - \
+ && echo '471de59ae2289c064f981de4fde7334060bb1c1ee35553eb50c2bd491de2798e  /opt/frigate/frigate/detectors/detection_runners.py' | sha256sum -c - \
+ && echo '07d27564b8ab67f228784283a83dbbfaacb862b29f526c95d0d5066c3f80e0f3  /opt/frigate/frigate/data_processing/real_time/bird.py' | sha256sum -c - \
+ && echo '1ed5f09128b09e69995bf9fcd101209e59977c9e6d3ed2ac0b4225ad18c9803b  /opt/frigate/frigate/data_processing/real_time/custom_classification.py' | sha256sum -c - \
+ && echo '44a8cb29b9f08a6a1cc44eba0c43e50b7ec598083d8b0ad0f088069a34f80ba6  /opt/frigate/frigate/embeddings/maintainer.py' | sha256sum -c - \
+ && echo '1955a5d1180d180be601aa51d2cab356c587fd53c3096163982d2da40b6f50f0  /opt/frigate/frigate/util/classification.py' | sha256sum -c - \
+ && echo 'aef67e49a48e23bd324de51fb048e033916db868216f5d5dd79d3ccf8866a360  /opt/frigate/frigate/util/model.py' | sha256sum -c - \
+ && echo '93292bdf2d7fe877ad5c0b5bc138f40ed74e2ab1b4ff4dcc735900c668f6fa46  /opt/frigate/frigate/object_detection/base.py' | sha256sum -c - \
+ && echo '58b73be084b622d73ee24320f9a9e3c4710083bd73cee2b71a21ee95191fd795  /opt/frigate/frigate/util/object.py' | sha256sum -c -
+
+COPY wildlife_speciesnet /opt/frigate/wildlife_speciesnet
+COPY docker/apply_patches.py /tmp/apply_patches.py
+COPY docker/patches /tmp/patches
+RUN python3 /tmp/apply_patches.py /opt/frigate /tmp/patches/*.patch && rm -rf /tmp/apply_patches.py /tmp/patches

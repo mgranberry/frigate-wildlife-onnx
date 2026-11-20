@@ -1,0 +1,23 @@
+# Minimal CPU PyTorch + Ultralytics + ONNX export image for prepare_extra_model.py.
+#
+# Build:
+#   docker build -f docker/Dockerfile.export -t frigate-wildlife-export .
+#
+# Use with prepare_extra_model.py:
+#   python3 prepare_extra_model.py --export-image frigate-wildlife-export ...
+
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install --no-install-recommends -y libgl1 libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    torch \
+    torchvision \
+    ultralytics==8.3.0 \
+    onnx \
+    onnxscript \
+    onnxruntime \
+    numpy \
+    opencv-python-headless \
+    Pillow

@@ -1,0 +1,259 @@
+diff --git a/frigate/comms/event_metadata_updater.py b/frigate/comms/event_metadata_updater.py
+index 8977788..2140018 100644
+--- a/frigate/comms/event_metadata_updater.py
++++ b/frigate/comms/event_metadata_updater.py
+@@ -15,6 +15,7 @@ class EventMetadataTypeEnum(str, Enum):
+     manual_event_end = "manual_event_end"
+     regenerate_description = "regenerate_description"
+     sub_label = "sub_label"
++    false_positive = "false_positive"
+     attribute = "attribute"
+     lpr_event_create = "lpr_event_create"
+     save_lpr_snapshot = "save_lpr_snapshot"
+diff --git a/frigate/config/classification.py b/frigate/config/classification.py
+index c2874ba..256d2f8 100644
+--- a/frigate/config/classification.py
++++ b/frigate/config/classification.py
+@@ -183,6 +183,18 @@ class CustomClassificationObjectConfig(FrigateBaseModel):
+         description="Multiplier applied to the bounding box dimensions before cropping.",
+         ge=1.0,
+     )
++    reject_labels: list[str] = Field(
++        default_factory=list,
++        title="Reject labels",
++        description="Classification labels that mark the tracked object as a false positive.",
++    )
++    reject_threshold: float = Field(
++        default=0.85,
++        title="Reject threshold",
++        description="Minimum consensus score required for reject_labels to mark false_positive.",
++        ge=0.0,
++        le=1.0,
++    )
+ 
+ 
+ class CustomClassificationConfig(FrigateBaseModel):
+diff --git a/frigate/data_processing/real_time/custom_classification.py b/frigate/data_processing/real_time/custom_classification.py
+index 94d7f79..7980852 100644
+--- a/frigate/data_processing/real_time/custom_classification.py
++++ b/frigate/data_processing/real_time/custom_classification.py
+@@ -9,6 +9,8 @@ from typing import Any
+ 
+ import cv2
+ import numpy as np
++from wildlife_speciesnet.constants import Classification
++from wildlife_speciesnet.postprocess import GeographicRollup, display_name
+ 
+ from frigate.comms.embeddings_updater import EmbeddingsRequestEnum
+ from frigate.comms.event_metadata_updater import EventMetadataPublisher
+@@ -832,10 +834,53 @@ class CustomObjectClassificationProcessor(_BaseCustomClassificationProcessor):
+         metrics: DataProcessorMetrics,
+     ):
+         super().__init__(config, model_config, requestor, metrics, max_queue=8)
++        self.geographic_rollup: GeographicRollup | None = None
+         self.sub_label_publisher = sub_label_publisher
+         self.classification_history: dict[str, list[tuple[str, float, float]]] = {}
+         self._initialize_detector()
+ 
++    def _on_backend_loaded(self) -> None:
++        self.geographic_rollup = None
++        if isinstance(self.backend, ONNXClassifierBackend):
++            self.geographic_rollup = GeographicRollup.from_environment()
++            if self.geographic_rollup is not None:
++                logger.info(
++                    "SpeciesNet geographic rollup enabled for %s/%s",
++                    self.geographic_rollup.country,
++                    self.geographic_rollup.region,
++                )
++
++    def _predict_top_class(
++        self, resized_rgb: np.ndarray, timestamp: float
++    ) -> tuple[str, float] | None:
++        if self.geographic_rollup is None:
++            return super()._predict_top_class(resized_rgb, timestamp)
++
++        if self.backend is None:
++            return None
++
++        probs = self.backend.predict(resized_rgb)
++        if probs.size == 0:
++            return None
++
++        logger.debug(
++            "%s Ran %s classification with probabilities: %s",
++            self.model_config.name,
++            self._classifier_kind,
++            probs,
++        )
++        geo_label, geo_score, _ = self.geographic_rollup.predict(probs)
++        self._update_metrics(datetime.datetime.now().timestamp() - timestamp)
++        non_species = {
++            Classification.BLANK: "blank",
++            Classification.HUMAN: "human",
++            Classification.VEHICLE: "vehicle",
++        }
++        predicted_label = non_species.get(geo_label) or display_name(geo_label)
++        return predicted_label, round(float(geo_score), 2)
++
+     def get_weighted_score(
+         self,
+         object_id: str,
+@@ -1052,6 +1097,13 @@ class CustomObjectClassificationProcessor(_BaseCustomClassificationProcessor):
+             f"{self.model_config.name}: Object {object_id} passed threshold with sub_label={sub_label}, score={score}"
+         )
+ 
++        if (
++            self.model_config.object_config is not None
++            and sub_label in ("blank", "human", "vehicle", "car")
++            and sub_label not in self.model_config.object_config.reject_labels
++        ):
++            sub_label = "none"
++
+         consensus_label, consensus_score = self.get_weighted_score(
+             object_id, sub_label, score, timestamp
+         )
+@@ -1061,6 +1113,24 @@ class CustomObjectClassificationProcessor(_BaseCustomClassificationProcessor):
+         )
+ 
+         if consensus_label is not None and self.model_config.object_config is not None:
++            if (
++                consensus_label in self.model_config.object_config.reject_labels
++                and consensus_score >= self.model_config.object_config.reject_threshold
++            ):
++                self._emit_result(
++                    {
++                        "type": "classification",
++                        "processor": "object_reject",
++                        "model_name": self.model_config.name,
++                        "object_id": object_id,
++                        "camera": camera,
++                        "timestamp": timestamp,
++                        "label": consensus_label,
++                        "score": consensus_score,
++                    }
++                )
++                return
++
+             self._emit_result(
+                 {
+                     "type": "classification",
+diff --git a/frigate/embeddings/maintainer.py b/frigate/embeddings/maintainer.py
+index 053ca34..94cea2a 100644
+--- a/frigate/embeddings/maintainer.py
++++ b/frigate/embeddings/maintainer.py
+@@ -889,6 +889,11 @@ class EmbeddingMaintainer(threading.Thread):
+                             ),
+                             DetectionTypeEnum.classification_state.value,
+                         )
++                elif result["processor"] == "object_reject":
++                    self.event_metadata_publisher.publish(
++                        (result["object_id"],),
++                        EventMetadataTypeEnum.false_positive.value,
++                    )
+                 elif result["processor"] == "object":
+                     object_id = result["object_id"]
+                     camera = result["camera"]
+diff --git a/frigate/object_detection/base.py b/frigate/object_detection/base.py
+index 958bbb1..a202b78 100644
+--- a/frigate/object_detection/base.py
++++ b/frigate/object_detection/base.py
+@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
+ 
+ class ObjectDetector(ABC):
+     @abstractmethod
+-    def detect(self, tensor_input: np.ndarray, threshold: float = 0.4) -> list:
++    def detect(self, tensor_input: np.ndarray, threshold: float = 0.15) -> list:
+         pass
+ 
+ 
+@@ -80,7 +80,7 @@ class BaseLocalDetector(ObjectDetector):
+ 
+         return tensor_input
+ 
+-    def detect(self, tensor_input: np.ndarray, threshold: float = 0.4) -> list:
++    def detect(self, tensor_input: np.ndarray, threshold: float = 0.15) -> list:
+         detections = []
+ 
+         raw_detections = self.detect_raw(tensor_input)  # type: ignore[attr-defined]
+@@ -436,7 +436,7 @@ class RemoteObjectDetector:
+         )
+         self.detector_subscriber = ObjectDetectorSubscriber(name)
+ 
+-    def detect(self, tensor_input: np.ndarray, threshold: float = 0.4) -> list:
++    def detect(self, tensor_input: np.ndarray, threshold: float = 0.15) -> list:
+         detections: list = []
+ 
+         if self.stop_event.is_set():
+diff --git a/frigate/track/object_processing.py b/frigate/track/object_processing.py
+index c5c7b4d..ea147d7 100644
+--- a/frigate/track/object_processing.py
++++ b/frigate/track/object_processing.py
+@@ -418,6 +418,15 @@ class TrackedObjectProcessor(threading.Thread):
+ 
+         return camera_state.current_frame_time
+ 
++    def mark_false_positive(self, event_id: str) -> None:
++        """Mark a tracked object / event as a false positive."""
++        for state in self.camera_states.values():
++            tracked_obj = state.tracked_objects.get(event_id)
++            if tracked_obj is not None:
++                tracked_obj.false_positive = True
++                break
++        Event.update(false_positive=True).where(Event.id == event_id).execute()
++
+     def set_sub_label(
+         self, event_id: str, sub_label: str | None, score: float | None
+     ) -> None:
+@@ -836,6 +845,9 @@ class TrackedObjectProcessor(threading.Thread):
+                 if topic.endswith(EventMetadataTypeEnum.sub_label.value):
+                     (event_id, sub_label, score) = payload
+                     self.set_sub_label(event_id, sub_label, score)
++                elif topic.endswith(EventMetadataTypeEnum.false_positive.value):
++                    (event_id,) = payload
++                    self.mark_false_positive(event_id)
+                 if topic.endswith(EventMetadataTypeEnum.attribute.value):
+                     (event_id, field_name, field_value, score) = payload
+                     self.set_object_attribute(event_id, field_name, field_value, score)
+diff --git a/frigate/util/model.py b/frigate/util/model.py
+index 9e7c4ed..eb3bfe8 100644
+--- a/frigate/util/model.py
++++ b/frigate/util/model.py
+@@ -51,7 +51,7 @@ def post_process_dfine(
+     input_shape = np.array([height, width, height, width])
+     boxes = np.divide(boxes, input_shape, dtype=np.float32)
+     indices = cv2.dnn.NMSBoxes(
+-        xyxy_to_xywh_for_nms(boxes), scores, score_threshold=0.4, nms_threshold=0.4
++        xyxy_to_xywh_for_nms(boxes), scores, score_threshold=0.15, nms_threshold=0.4
+     )
+     detections = np.zeros((20, 6), np.float32)
+ 
+@@ -222,9 +222,12 @@ def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarra
+         predictions = predictions.T
+ 
+     scores = np.max(predictions[:, 4:], axis=1)
+-    predictions = predictions[scores > 0.4, :]
+-    scores = scores[scores > 0.4]
+     class_ids = np.argmax(predictions[:, 4:], axis=1)
++    min_scores = np.where(class_ids == 0, 0.15, 0.4)
++    keep = scores > min_scores
++    predictions = predictions[keep, :]
++    scores = scores[keep]
++    class_ids = class_ids[keep]
+ 
+     # Rescale box
+     boxes = predictions[:, :4]
+diff --git a/frigate/util/object.py b/frigate/util/object.py
+index ecb7100..5081798 100644
+--- a/frigate/util/object.py
++++ b/frigate/util/object.py
+@@ -520,8 +520,9 @@ def reduce_detections(
+             # due to min score requirement of NMSBoxes
+             confidences = [0.6 if clipped(o, frame_shape) else o[1] for o in group]
+ 
++            nms_floor = 0.15 if label == "animal" else 0.5
+             indices = cv2.dnn.NMSBoxes(
+-                boxes, confidences, 0.5, LABEL_NMS_MAP.get(label, LABEL_NMS_DEFAULT)
++                boxes, confidences, nms_floor, LABEL_NMS_MAP.get(label, LABEL_NMS_DEFAULT)
+             )
+ 
+             # add objects
