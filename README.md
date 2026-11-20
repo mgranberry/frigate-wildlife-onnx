@@ -72,6 +72,41 @@ docker build \
 - Use **`MDV6-yolov10-c` (`320x320`)**: runs at **16.6 ms p50** (~60 FPS) even on a 4-core Intel N95 CPU with ONNX Runtime.
 - `SpeciesNet v4.0.3a` (`480x480`) runs at ~1.2 s/crop on an N95 CPU (OpenVINO CPU). Because classification only runs on detected `animal` crops rather than every motion frame, this is still workable for quiet cameras with occasional wildlife visits, though a GPU/iGPU is strongly recommended for busier scenes.
 
+
+### Path 5: NVIDIA DGX Spark (ARM64 Blackwell `sm_121`, CUDA 13 + TensorRT)
+
+Upstream Frigate does not yet publish an `aarch64` CUDA 13 / Blackwell `sm_121` TensorRT image. The `docker/dgx-spark/` directory contains the full builder and runtime Dockerfiles to reproduce the DGX Spark stack:
+
+1. Build the ARM64 CUDA 13.1 + TensorRT 10.15 `onnxruntime-gpu` wheel (`sm_120;121`) and base image (`frigate:dev-cuda13` -> `frigate:dev-cuda13-trt`) following `docker/dgx-spark/ort-build/README.md` and `docker/dgx-spark/Dockerfile.cuda13-base`.
+2. Layer the wildlife patches onto `frigate:dev-cuda13-trt`:
+   ```bash
+   docker build \
+     --build-arg BASE_IMAGE=frigate:dev-cuda13-trt \
+     -f docker/Dockerfile.frigate-wildlife \
+     -t frigate:wildlife-cuda13 .
+   ```
+3. See `examples/docker-compose.dgx-spark.yml` and `examples/frigate-config.dgx-spark.yaml` for a complete working Compose + Frigate `0.19-0` configuration.
+
+## Optional Extra: BioCAP Wildlife Semantic Search (`docker/biocap/`)
+
+`docker/biocap/` provides an optional OpenAI/`llama.cpp`-compatible `/v1/embeddings` sidecar running [`imageomics/biocap`](https://huggingface.co/imageomics/biocap) (a biology/wildlife-tuned CLIP model) for Frigate's `semantic_search`:
+
+1. Export the ONNX vision/text encoders and tokenizer vocabulary (`export_biocap.py` requires `open_clip_torch`, `torch`, `onnx`):
+   ```bash
+   python3 docker/biocap/export_biocap.py
+   ```
+2. Build the sidecar image:
+   - **DGX Spark (`TensorrtExecutionProvider`)**:
+     ```bash
+     docker build --build-arg TRT_LIBS_IMAGE=frigate:dev-cuda13-trt \
+       -f docker/biocap/Dockerfile -t frigate-biocap:trt13 docker/biocap
+     ```
+   - **Generic x86_64 CUDA or CPU**:
+     ```bash
+     docker build -f docker/biocap/Dockerfile.generic -t frigate-biocap:generic docker/biocap
+     ```
+3. Wire it into Frigate using the `genai:` and `semantic_search:` blocks in `examples/frigate-config.dgx-spark.yaml` and `examples/docker-compose.dgx-spark.yml`.
+
 ### Measured Reference Latencies
 
 Single-stream sequential inference (`batch=1`, warm):
@@ -144,7 +179,8 @@ When running the `docker/Dockerfile.frigate-wildlife` overlay image:
 - `prepare_speciesnet_labels.py`: Generates the 2,498-line readable `speciesnet-labelmap.txt` matching classifier output order.
 - `wildlife_speciesnet/` & `test_geofence.py`: Isolated SpeciesNet geographic rollup & geofence postprocessing + unit tests (`python3 test_geofence.py -v`).
 - `test_adapter.py`: Validates adapted MegaDetector ONNX outputs against the unadapted model inside a Frigate container.
-- `docker/`: Reproducible `Dockerfile.frigate-wildlife` (with `patches/` and `apply_patches.py`) and `Dockerfile.export`.
+- `docker/`: Reproducible `Dockerfile.frigate-wildlife` (with `patches/` and `apply_patches.py`), `Dockerfile.export`, `docker/dgx-spark/` (ARM64 Blackwell CUDA 13 + TensorRT ORT wheel builder & base Dockerfile), and `docker/biocap/` (optional BioCAP embeddings sidecar).
+- `examples/`: Sample `docker-compose.dgx-spark.yml` and `frigate-config.dgx-spark.yaml`.
 
 ## Quick Usage (Reproducing Models)
 

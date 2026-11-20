@@ -1,0 +1,86 @@
+# Sample Frigate 0.19-0 config for MegaDetector v6 YOLOv10-e (TensorRT),
+# SpeciesNet v4.0.3a (TensorRT + geofence + blank rejection), and optional
+# BioCAP wildlife semantic search.
+
+mqtt:
+  enabled: false
+
+ffmpeg:
+  hwaccel_args: preset-nvidia
+
+models:
+  - scene: default
+    path: /config/model_cache/megadetector-v6-yolov10e-320/model.onnx
+    labelmap_path: /config/model_cache/megadetector-v6-yolov10e-320/labels.txt
+    model_type: yolo-generic
+    width: 320
+    height: 320
+    input_tensor: nhwc
+    input_dtype: int
+    input_pixel_format: rgb
+    devices:
+      - onnx:Tensorrt
+
+objects:
+  track:
+    - animal
+    - person
+    - car
+  filters:
+    animal:
+      min_score: 0.25
+      threshold: 0.60
+
+classification:
+  custom:
+    wildlife:
+      enabled: true
+      name: wildlife
+      device: Tensorrt
+      width: 480
+      height: 480
+      input_tensor: nhwc
+      input_dtype: int
+      input_pixel_format: rgb
+      threshold: 0.60
+      save_attempts: 0
+      object_config:
+        objects:
+          - animal
+        classification_type: sub_label
+        crop_strategy: tight
+        crop_scale: 1.0
+        reject_labels:
+          - blank
+        reject_threshold: 0.50
+
+# Optional: BioCAP wildlife semantic search (requires biocap-embeddings sidecar)
+genai:
+  biocap:
+    provider: llamacpp
+    base_url: http://biocap-embeddings:8090
+    model: imageomics/biocap
+    roles:
+      - embeddings
+
+semantic_search:
+  enabled: true
+  model: biocap
+
+cameras:
+  wildlife_cam:
+    ffmpeg:
+      inputs:
+        - path: rtsp://user:pass@192.0.2.10:554/stream1
+          roles:
+            - detect
+            - record
+    detect:
+      enabled: true
+      width: 1280
+      height: 960
+      fps: 10
+    snapshots:
+      enabled: true
+
+version: 0.19-0

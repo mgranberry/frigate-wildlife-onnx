@@ -1,0 +1,22 @@
+# Generic BioCAP embeddings sidecar (x86_64 CUDA or CPU).
+# Build:
+#   docker build -f docker/biocap/Dockerfile.generic -t frigate-biocap:generic docker/biocap
+# For CPU-only, pass --build-arg ORT_PACKAGE=onnxruntime
+
+FROM python:3.11-slim-bookworm
+ARG ORT_PACKAGE=onnxruntime-gpu
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m pip install --no-cache-dir \
+      ${ORT_PACKAGE} numpy pillow ftfy regex fastapi uvicorn
+
+WORKDIR /app
+COPY server.py /app/server.py
+
+EXPOSE 8090
+CMD ["python3", "/app/server.py"]

@@ -1,0 +1,14 @@
+FROM ort-builder:cuda13
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      libnvinfer-headers-dev=10.15.1.29-1+cuda13.1 \
+      libnvinfer10=10.15.1.29-1+cuda13.1 \
+      libnvinfer-dev=10.15.1.29-1+cuda13.1 \
+      libnvonnxparsers10=10.15.1.29-1+cuda13.1 \
+      libnvonnxparsers-dev=10.15.1.29-1+cuda13.1 \
+      libnvinfer-headers-plugin-dev=10.15.1.29-1+cuda13.1 \
+      libnvinfer-plugin10=10.15.1.29-1+cuda13.1 \
+      libnvinfer-plugin-dev=10.15.1.29-1+cuda13.1 \
+ && rm -rf /var/lib/apt/lists/*
+ENV PATH="/usr/local/cuda-13.1/bin:${PATH}"

@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=frigate:dev-cuda13
+FROM frigate-ort-builder:tensorrt13 AS tensorrt
+FROM ${BASE_IMAGE}
+COPY --from=tensorrt /usr/lib/aarch64-linux-gnu/libnvinfer*.so* /usr/lib/aarch64-linux-gnu/
+COPY --from=tensorrt /usr/lib/aarch64-linux-gnu/libnvonnxparser*.so* /usr/lib/aarch64-linux-gnu/
+COPY onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl /tmp/ort-tensorrt.whl
+RUN rm -rf /usr/local/lib/python3.11/dist-packages/onnxruntime* \
+ && mv /tmp/ort-tensorrt.whl /tmp/onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl \
+ && python3 -m pip install --no-cache-dir --break-system-packages /tmp/onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl \
+ && rm /tmp/onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl \
+ && ldconfig

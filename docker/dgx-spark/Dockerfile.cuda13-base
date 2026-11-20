@@ -1,0 +1,27 @@
+# Frigate 0.19.0-dev (1c30924) base used for the deployed wildlife integration.
+FROM ghcr.io/blakeblackshear/frigate@sha256:113780104ac5c0558d9d7ef34f2f32b4078beae3148bb2360c4906fa172084ed
+
+# Install CUDA 13 runtime packages
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    wget ca-certificates && \
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/sbsa/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && \
+    apt-get install --no-install-recommends -y \
+    cuda-cudart-13-1 \
+    libcublas-13-1 \
+    libcurand-13-1 \
+    libcufft-13-1 \
+    libcudnn9-cuda-13 && \
+    find /usr/local/cuda* -name "lib*.so.13*" -o -name "lib*.so.10*" | while read f; do ln -s "$f" "/usr/lib/$(basename "$f")" 2>/dev/null || true; done && \
+    ldconfig && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Remove upstream stock onnxruntime binaries and install locally compiled ONNX Runtime GPU (Blackwell sm_121 native)
+COPY onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl /tmp/
+RUN rm -rf /usr/local/lib/python3.11/dist-packages/onnxruntime* && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+    /tmp/onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl && \
+    rm /tmp/onnxruntime_gpu-1.32.0-cp311-cp311-linux_aarch64.whl

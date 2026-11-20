@@ -1,0 +1,66 @@
+# Sample Docker Compose for NVIDIA DGX Spark (ARM64 Blackwell sm_121, CUDA 13 + TensorRT)
+# with optional BioCAP wildlife semantic search sidecar.
+#
+# Prerequisites:
+#   1. Build frigate:dev-cuda13 and frigate:dev-cuda13-trt (see docker/dgx-spark/ort-build/README.md)
+#   2. Build the wildlife overlay:
+#        docker build --build-arg BASE_IMAGE=frigate:dev-cuda13-trt \
+#          -f docker/Dockerfile.frigate-wildlife -t frigate:wildlife-cuda13 .
+#   3. Optional (for BioCAP semantic search):
+#        python3 docker/biocap/export_biocap.py  # outputs ONNX + vocab into ./models/biocap
+#        docker build --build-arg TRT_LIBS_IMAGE=frigate:dev-cuda13-trt \
+#          -f docker/biocap/Dockerfile -t frigate-biocap:trt13 docker/biocap
+
+services:
+  biocap-embeddings:
+    image: frigate-biocap:trt13
+    container_name: biocap-embeddings
+    restart: unless-stopped
+    mem_limit: 6g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./models/biocap:/models
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 5s
+
+  frigate:
+    image: frigate:wildlife-cuda13
+    container_name: frigate
+    depends_on:
+      biocap-embeddings:
+        condition: service_healthy
+    privileged: true
+    restart: unless-stopped
+    shm_size: "1gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./config:/config
+      - ./media:/media/frigate
+    ports:
+      - "5000:5000"
+      - "8971:8971"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+    environment:
+      - TZ=America/Chicago
+      - FRIGATE_SPECIESNET_COUNTRY=USA
+      - FRIGATE_SPECIESNET_STATE=TX
+      - USE_FP16=true
